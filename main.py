@@ -1,36 +1,60 @@
 import base64
 import os
+import logging
+from functools import lru_cache
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 from openai import OpenAI
 import requests
-from pydantic import BaseModel
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, unquote
 
 
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY")
-)
+logger = logging.getLogger(__name__)
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+
+@lru_cache
+def get_client():
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(status_code=503, detail="AI service is not configured")
+    return OpenAI(api_key=key, timeout=45.0, max_retries=0)
+
+
+def generate_text(content):
+    client = get_client()
+    try:
+        response = client.responses.create(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            input=[{"role": "user", "content": content}],
+        )
+        text = response.output_text.strip()
+        if not text:
+            raise ValueError("Empty model response")
+        return text
+    except Exception:
+        logger.exception("AI request failed")
+        raise HTTPException(status_code=502, detail="AI service could not complete the request") from None
 
 app = FastAPI(
     title="TourGuideAI Vision Backend",
-    description="Receives image - sends json with location name",
+    description="Recognizes landmark photos and generates Wikipedia-grounded tour stories.",
     version="1.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 WIKIPEDIA_HEADERS = {
-    "User-Agent": "TourGuideAI/1.0 (https://example.com; contact@example.com)"
+    "User-Agent": "TourGuideAI/1.0 (https://github.com/Ivan-here/Tour-Guide-App-Backend)"
 }
 
 class LandmarkResponse(BaseModel):
@@ -39,10 +63,11 @@ class LandmarkResponse(BaseModel):
 
 
 class StoryRequest(BaseModel):
-    landmark: str
-    style: str | None = "neutral"    # e.g. funny, scary, romantic
-    tone: str | None = "casual"      # e.g. casual, formal
-    length: str | None = "medium"    # short, medium, long
+    model_config = ConfigDict(str_strip_whitespace=True)
+    landmark: str = Field(min_length=1, max_length=200)
+    style: str = Field(default="neutral", min_length=1, max_length=80)
+    tone: str = Field(default="casual", min_length=1, max_length=80)
+    length: str = Field(default="medium", pattern="^(short|medium|long)$")
 
 
 class StoryResponse(BaseModel):
@@ -81,7 +106,7 @@ def get_wikipedia_url(landmark: str) -> str | None:
             print("Wiki search: top result has no title")
             return None
 
-        slug = title.replace(" ", "_")
+        slug = quote(title.replace(" ", "_"), safe="")
         url = f"{WIKIPEDIA_BASE_PAGE_URL}{slug}"
         print(f"[Wikipedia] Resolved '{landmark}' -> {url}")
         return url
@@ -90,14 +115,23 @@ def get_wikipedia_url(landmark: str) -> str | None:
         print("Wiki search exception:", repr(e))
         return None
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "ai_configured": bool(os.environ.get("OPENAI_API_KEY", "").strip())}
+
+
 @app.post("/recognize-landmark", response_model=LandmarkResponse)
-async def recognize_landmark(image: UploadFile = File(...)):
-    if not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+def recognize_landmark(image: UploadFile = File(...)):
+    if image.content_type not in SUPPORTED_IMAGE_TYPES:
+        raise HTTPException(status_code=415, detail="Use a JPEG, PNG, WebP, or GIF image")
+
+    image_bytes = image.file.read(MAX_IMAGE_BYTES + 1)
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Image is empty")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds the 10 MiB limit")
 
     try:
-        image_bytes = await image.read()
-
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
         data_url = f"data:{image.content_type};base64,{b64_image}"
 
@@ -109,20 +143,11 @@ async def recognize_landmark(image: UploadFile = File(...)):
             "Respond with ONLY the name of the landmark or 'Unknown landmark'."
         )
 
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": data_url},
-                    ],
-                }
-            ],
-        )
-        model_text = response.output_text.strip()
-        if model_text.lower().strip() in {"unknown", "unknown landmark", "not a landmark"}:
+        model_text = generate_text([
+            {"type": "input_text", "text": prompt},
+            {"type": "input_image", "image_url": data_url},
+        ])
+        if model_text.lower().strip(" .\"'") in {"unknown", "unknown landmark", "not a landmark"}:
             landmark_name = "Unknown landmark"
         else:
             landmark_name = model_text.strip().strip('"').strip("'")
@@ -132,13 +157,11 @@ async def recognize_landmark(image: UploadFile = File(...)):
             raw_model_response=model_text,
         )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Vision processing failed: {e}")
-
-#docker-compose up --build -d
-
-
-
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Vision processing failed")
+        raise HTTPException(status_code=500, detail="Vision processing failed") from None
 
 def get_wikipedia_summary(landmark: str) -> str | None:
 
@@ -149,7 +172,7 @@ def get_wikipedia_summary(landmark: str) -> str | None:
     try:
         path = urlparse(wiki_url).path        # "/wiki/CN_Tower"
         slug = path.rsplit("/", 1)[-1]        # "CN_Tower"
-        title = slug.replace("_", " ")        # "CN Tower" (Wikipedia title format)
+        title = unquote(slug).replace("_", " ")
 
         params = {
             "action": "query",
@@ -157,6 +180,7 @@ def get_wikipedia_summary(landmark: str) -> str | None:
             "exintro": 1,         # only intro paragraph
             "explaintext": 1,     # plain text (no HTML)
             "titles": title,
+            "redirects": 1,
             "format": "json",
             "utf8": 1,
         }
@@ -187,7 +211,7 @@ def get_wikipedia_summary(landmark: str) -> str | None:
         return None
 
 @app.post("/generate-story", response_model=StoryResponse)
-async def generate_story(payload: StoryRequest):
+def generate_story(payload: StoryRequest):
     """
     1. Takes a landmark + user preferences (style, tone, length).
     2. Fetches Wikipedia summary.
@@ -221,20 +245,7 @@ async def generate_story(payload: StoryRequest):
         "- Keep it readable on a phone (2–5 short paragraphs).\n"
     )
 
-    # Using the same OpenAI client you already configured
-    response = client.responses.create(
-        model="gpt-4o-mini",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                ],
-            }
-        ],
-    )
-
-    story_text = response.output_text.strip()
+    story_text = generate_text([{"type": "input_text", "text": prompt}])
 
     return StoryResponse(
         landmark=payload.landmark,
